@@ -1,4 +1,8 @@
 ﻿#pragma kernel ClearBuffer
 #pragma kernel PrefixScan
 
+#pragma use_dxc
+#pragma require wavebasic
+#pragma require waveballot
+
 #include "../GPUOneSweepPrefixScan.hlsl"

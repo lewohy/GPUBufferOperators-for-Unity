@@ -4,6 +4,10 @@
 //#pragma kernel ClearBuffer
 //#pragma kernel PrefixScan
 
+//#pragma use_dxc
+//#pragma require wavebasic
+//#pragma require waveballot
+
 #define NUM_GROUP_THREADS 128
 
 // macro used for computing bank-conflict-free shared memory array indices
@@ -19,8 +23,10 @@ static const FLAG FLAG_AGGREGATE = 1;
 static const FLAG FLAG_PREFIX    = 2;
 static const uint partition_descriptor_flag_mask = 0x00000003;
 static const uint partition_descriptor_value_shift = 2;
+static const uint parallelized_look_back_count = 16; // WaveGetLaneCount() must be more than or equal to this value
 
 RWStructuredBuffer<uint> data_buffer;
+// As far as I tested, (rw_structured_buffer + atomic_add) is faster than (counter_buffer + increment_counter).
 globallycoherent RWStructuredBuffer<uint> partition_index_buffer;
 globallycoherent RWStructuredBuffer<PARTITION_DESCRIPTOR> partition_descriptor_buffer;
 
@@ -74,25 +80,44 @@ inline uint Lookback(uint group_thread_id, uint partition_index)
     }
 
     uint prev_reduction = 0u;
-    uint look_back_id = partition_index - 1u;
+    uint look_back_id = partition_index;
 
-    if (group_thread_id == 0u)
+    while (true)
     {
-        while (true)
+        if (group_thread_id < min(parallelized_look_back_count, look_back_id))
         {
-            const PARTITION_DESCRIPTOR partition_descriptor = partition_descriptor_buffer[look_back_id];
+            const PARTITION_DESCRIPTOR partition_descriptor = partition_descriptor_buffer[look_back_id - group_thread_id - 1u];
 
-            if (GetPartitionDescriptorFlag(partition_descriptor) != FLAG_INVALID)
+            const FLAG flag = GetPartitionDescriptorFlag(partition_descriptor);
+
+            if (!WaveActiveAnyTrue(flag == FLAG_INVALID)) // if all partition descriptors are aggregate or prefix
             {
-                prev_reduction += GetPartitionDescriptorValue(partition_descriptor);
-                if (GetPartitionDescriptorFlag(partition_descriptor) == FLAG_PREFIX)
+                const uint partition_descriptor_value = GetPartitionDescriptorValue(partition_descriptor);
+
+                if (WaveActiveAllTrue(flag == FLAG_AGGREGATE)) // if all partition descriptors are aggregate
                 {
-                    InterlockedAdd(partition_descriptor_buffer[partition_index], CreatePartitionDescriptor(prev_reduction, FLAG_PREFIX - FLAG_AGGREGATE));
-                    s_prev_reduction = prev_reduction;
+                    prev_reduction += WaveActiveSum(partition_descriptor_value);
+                    look_back_id -= parallelized_look_back_count;
+                }
+                else
+                {
+                    const uint lowest_prefix_wave_index = firstbitlow(WaveActiveBallot(flag == FLAG_PREFIX).x);
+                    if (group_thread_id <= lowest_prefix_wave_index)
+                    {
+                        prev_reduction += WaveActiveSum(partition_descriptor_value);
+                        if (group_thread_id == 0)
+                        {
+                            InterlockedAdd(partition_descriptor_buffer[partition_index], CreatePartitionDescriptor(prev_reduction, FLAG_PREFIX - FLAG_AGGREGATE));
+                            s_prev_reduction = prev_reduction;
+                        }
+                    }
                     break;
                 }
-                look_back_id--;
             }
+        }
+        else
+        {
+            break;
         }
     }
     GroupMemoryBarrierWithGroupSync();
