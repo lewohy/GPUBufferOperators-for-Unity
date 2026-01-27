@@ -1,5 +1,6 @@
 ﻿using System;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace Abecombe.GPUBufferOperators
 {
@@ -279,6 +280,90 @@ namespace Abecombe.GPUBufferOperators
 
                 // copy input data to final position in global memory
                 cs.DispatchIndirect(k_shuffle, _groupSizeBuffer);
+            }
+        }
+
+
+        public void Sort(CommandBuffer cmb, GraphicsBuffer dataBuffer, SortingOrder sortingOrder, KeyType keyType, uint maxValue = uint.MaxValue)
+        {
+            Sort(cmb, dataBuffer, 0, dataBuffer.count, sortingOrder, keyType, maxValue);
+        }
+
+        public void Sort(CommandBuffer cmb, GraphicsBuffer dataBuffer, int startIndex, int endIndex, SortingOrder sortingOrder, KeyType keyType, uint maxValue = uint.MaxValue)
+        {
+            if (!_inited) Init();
+
+            var cs = RadixSortCs;
+            var k_local = _kernelRadixSortLocal;
+            var k_shuffle = _kernelGlobalShuffle;
+
+            int bufferSize = dataBuffer.count;
+            int maxNumGroups = (bufferSize + NumElementsPerGroup - 1) / NumElementsPerGroup;
+
+            CheckBufferSizeChanged(bufferSize, maxNumGroups, dataBuffer.stride);
+
+            cs.DisableKeyword("USE_INDIRECT_DISPATCH");
+
+            // cs.SetInt("key_type", (int)keyType);
+            cmb.SetComputeIntParam(cs, "key_type", (int)keyType);
+            // cs.SetInt("sorting_order", (int)sortingOrder);
+            cmb.SetComputeIntParam(cs, "sorting_order", (int)sortingOrder);
+
+            _sortStartEndIndexArray[0] = startIndex;
+            _sortStartEndIndexArray[1] = endIndex;
+            // cs.SetInts("start_end_index", _sortStartEndIndexArray);
+            cmb.SetComputeIntParams(cs, "start_end_index", _sortStartEndIndexArray);
+
+            int threadCount = endIndex - startIndex;
+            int groupCount = (threadCount + NumElementsPerGroup - 1) / NumElementsPerGroup;
+            Vector3Int groupSize = groupCount switch
+            {
+                <= MaxDispatchSize => new Vector3Int(groupCount, 1, 1),
+                <= 16 * MaxDispatchSize => new Vector3Int(16, (groupCount + 15) / 16, 1),
+                <= 128 * MaxDispatchSize => new Vector3Int(128, (groupCount + 127) / 128, 1),
+                _ => new Vector3Int(1024, (groupCount + 1023) / 1024, 1)
+            };
+            _groupSizeArray[0] = groupSize.x;
+            _groupSizeArray[1] = groupSize.y;
+            _groupSizeArray[2] = groupSize.z;
+            _groupSizeArray[3] = groupCount;
+            // cs.SetInts("group_size", _groupSizeArray);
+            cmb.SetComputeIntParams(cs, "group_size", _groupSizeArray);
+
+            // cs.SetBuffer(k_local, "data_in_buffer", dataBuffer);
+            cmb.SetComputeBufferParam(cs, k_local, "data_in_buffer", dataBuffer);
+            // cs.SetBuffer(k_local, "data_out_buffer", _tempBuffer);
+            cmb.SetComputeBufferParam(cs, k_local, "data_out_buffer", _tempBuffer);
+            // cs.SetBuffer(k_local, "first_index_buffer", _firstIndexBuffer);
+            cmb.SetComputeBufferParam(cs, k_local, "first_index_buffer", _firstIndexBuffer);
+            // cs.SetBuffer(k_local, "group_sum_buffer", _groupSumBuffer);
+            cmb.SetComputeBufferParam(cs, k_local, "group_sum_buffer", _groupSumBuffer);
+
+            // cs.SetBuffer(k_shuffle, "data_in_buffer", _tempBuffer);
+            cmb.SetComputeBufferParam(cs, k_shuffle, "data_in_buffer", _tempBuffer);
+            // cs.SetBuffer(k_shuffle, "data_out_buffer", dataBuffer);
+            cmb.SetComputeBufferParam(cs, k_shuffle, "data_out_buffer", dataBuffer);
+            // cs.SetBuffer(k_shuffle, "first_index_buffer", _firstIndexBuffer);
+            cmb.SetComputeBufferParam(cs, k_shuffle, "first_index_buffer", _firstIndexBuffer);
+            // cs.SetBuffer(k_shuffle, "global_prefix_sum_buffer", _groupSumBuffer);
+            cmb.SetComputeBufferParam(cs, k_shuffle, "global_prefix_sum_buffer", _groupSumBuffer);
+
+            int firstBitHigh = keyType == KeyType.UInt ? GetHighestBitPosition(maxValue) : 32;
+            for (int bitShift = 0; bitShift < firstBitHigh; bitShift += GetHighestBitPosition(NWay) - 1)
+            {
+                // cs.SetInt("bit_shift", bitShift);
+                cmb.SetComputeIntParam(cs, "bit_shift", bitShift);
+
+                // sort input data locally and output first-index / sums of each 4bit key-value within groups
+                // cs.Dispatch(k_local, groupSize.x, groupSize.y, groupSize.z);
+                cmb.DispatchCompute(cs, k_local, groupSize.x, groupSize.y, groupSize.z);
+
+                // prefix scan global group sum data
+                _prefixScan.ExclusiveScan(cmb, _groupSumBuffer);
+
+                // copy input data to final position in global memory
+                // cs.Dispatch(k_shuffle, groupSize.x, groupSize.y, groupSize.z);
+                cmb.DispatchCompute(cs, k_shuffle, groupSize.x, groupSize.y, groupSize.z);
             }
         }
 

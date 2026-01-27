@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace Abecombe.GPUBufferOperators
 {
@@ -272,6 +273,120 @@ namespace Abecombe.GPUBufferOperators
             {
                 cs.SetInt("group_offset", i);
                 cs.Dispatch(k_add, Mathf.Min(numGroups - i, MaxDispatchSize), 1, 1);
+            }
+        }
+
+        public void ExclusiveScan(CommandBuffer cmb, GraphicsBuffer dataBuffer, DataType dataType = DataType.UInt)
+        {
+            Scan(cmb, ScanType.Exclusive, dataType, dataBuffer, null, 0, false, 0);
+        }
+
+        private void Scan(CommandBuffer cmb, ScanType scanType, DataType dataType, GraphicsBuffer dataBuffer, GraphicsBuffer totalSumBuffer, uint bufferOffset, bool returnTotalSum, int recursiveDepth)
+        {
+            if (!_inited) Init();
+
+            _totalSumBuffer ??= new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(uint));
+            totalSumBuffer ??= _totalSumBuffer;
+
+            var cs = PrefixScanCs;
+            var k_scan = _kernelPrefixScan;
+            var k_add = _kernelAddGroupSum;
+
+            SetDataType(cs, dataType);
+
+            int numElements = dataBuffer.count;
+
+            int numGroupThreads = SetNumGroupThreads(cs, numElements);
+            int numElementsPerGroup = 2 * numGroupThreads;
+
+            int numGroups = (numElements + numElementsPerGroup - 1) / numElementsPerGroup;
+
+            _groupSumBufferList ??= new List<GraphicsBuffer>();
+            GraphicsBuffer groupSumBuffer;
+            if (_groupSumBufferList.Count == recursiveDepth)
+            {
+                groupSumBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, numGroups, sizeof(uint));
+                _groupSumBufferList.Add(groupSumBuffer);
+            }
+            else if (_groupSumBufferList.Count > recursiveDepth)
+            {
+                groupSumBuffer = _groupSumBufferList[recursiveDepth];
+                if (groupSumBuffer.count != numGroups)
+                {
+                    groupSumBuffer.Release();
+                    groupSumBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, numGroups, sizeof(uint));
+                    _groupSumBufferList[recursiveDepth] = groupSumBuffer;
+                }
+            }
+            else
+            {
+                Debug.LogError("Fatal Error in Prefix Scan");
+                return;
+            }
+
+            // scan input data locally and output total sums within groups
+            // cs.SetInt("num_elements", numElements);
+            cmb.SetComputeIntParam(cs, "num_elements", numElements);
+            // cs.SetInt("is_inclusive_scan", scanType == ScanType.Inclusive && recursiveDepth == 0 ? 1 : 0);
+            cmb.SetComputeIntParam(cs, "is_inclusive_scan", scanType == ScanType.Inclusive && recursiveDepth == 0 ? 1 : 0);
+            // cs.SetBuffer(k_scan, "data_buffer", dataBuffer);
+            cmb.SetComputeBufferParam(cs, k_scan, "data_buffer", dataBuffer);
+            // cs.SetBuffer(k_scan, "group_sum_buffer", groupSumBuffer);
+            cmb.SetComputeBufferParam(cs, k_scan, "group_sum_buffer", groupSumBuffer);
+            // cs.SetInt("group_sum_offset", 0);
+            cmb.SetComputeIntParam(cs, "group_sum_offset", 0);
+            for (int i = 0; i < numGroups; i += MaxDispatchSize)
+            {
+                // cs.SetInt("group_offset", i);
+                cmb.SetComputeIntParam(cs, "group_offset", i);
+                // cs.Dispatch(k_scan, Mathf.Min(numGroups - i, MaxDispatchSize), 1, 1);
+                cmb.DispatchCompute(cs, k_scan, Mathf.Min(numGroups - i, MaxDispatchSize), 1, 1);
+            }
+
+            // scan group total sums
+            if (numGroups <= numElementsPerGroup)
+            {
+                // cs.SetInt("num_elements", numGroups);
+                cmb.SetComputeIntParam(cs, "num_elements", numGroups);
+                // cs.SetInt("is_inclusive_scan", 0);
+                cmb.SetComputeIntParam(cs, "is_inclusive_scan", 0);
+                // cs.SetInt("group_offset", 0);
+                cmb.SetComputeIntParam(cs, "group_offset", 0);
+                // cs.SetBuffer(k_scan, "data_buffer", groupSumBuffer);
+                cmb.SetComputeBufferParam(cs, k_scan, "data_buffer", groupSumBuffer);
+                // cs.SetBuffer(k_scan, "group_sum_buffer", totalSumBuffer);
+                cmb.SetComputeBufferParam(cs, k_scan, "group_sum_buffer", totalSumBuffer);
+                // cs.SetInt("group_sum_offset", (int)bufferOffset);
+                cmb.SetComputeIntParam(cs, "group_sum_offset", (int)bufferOffset);
+                // cs.Dispatch(k_scan, 1, 1, 1);
+                cmb.DispatchCompute(cs, k_scan, 1, 1, 1);
+
+                if (returnTotalSum)
+                {
+                    totalSumBuffer.GetData(_totalSumArr, 0, (int)bufferOffset, 1);
+                    _totalSum = _totalSumArr[0];
+                }
+            }
+            // execute this function recursively
+            else
+            {
+                Scan(cmb, scanType, dataType, groupSumBuffer, totalSumBuffer, bufferOffset, returnTotalSum, recursiveDepth + 1);
+            }
+
+            // add each group's total sum to its scan output
+            SetNumGroupThreads(cs, numElements);
+            // cs.SetInt("num_elements", numElements);
+            cmb.SetComputeIntParam(cs, "num_elements", numElements);
+            // cs.SetBuffer(k_add, "data_buffer", dataBuffer);
+            cmb.SetComputeBufferParam(cs, k_add, "data_buffer", dataBuffer);
+            // cs.SetBuffer(k_add, "group_sum_buffer", groupSumBuffer);
+            cmb.SetComputeBufferParam(cs, k_add, "group_sum_buffer", groupSumBuffer);
+            for (int i = 0; i < numGroups; i += MaxDispatchSize)
+            {
+                // cs.SetInt("group_offset", i);
+                cmb.SetComputeIntParam(cs, "group_offset", i);
+                // cs.Dispatch(k_add, Mathf.Min(numGroups - i, MaxDispatchSize), 1, 1);
+                cmb.DispatchCompute(cs, k_add, Mathf.Min(numGroups - i, MaxDispatchSize), 1, 1);
             }
         }
 
