@@ -165,8 +165,9 @@ void RadixSortLocal(uint group_thread_id : SV_GroupThreadID, uint3 group_id : SV
     GroupMemoryBarrierWithGroupSync();
 
     // Hillis-Steele scan
-    [unroll(log_num_elements_per_group)]
-    for (uint offset = 1u;; offset <<= 1u)
+    // [unroll(log_num_elements_per_group)]
+    [unroll]
+    for (uint offset = 1u;offset < num_elements_per_group; offset <<= 1u)
     {
         uint4 sum = s_scan[group_thread_id];
         if (group_thread_id >= offset)
@@ -182,8 +183,9 @@ void RadixSortLocal(uint group_thread_id : SV_GroupThreadID, uint3 group_id : SV
     uint4 total = s_scan[num_elements_per_group_minus_1];
     uint4 first_index = 0u;
     uint run_sum = 0u;
-    [unroll(n_way)]
-    for (uint i = 0u;; ++i)
+    // [unroll(n_way)]
+    [unroll]
+    for (uint i = 0u;i < n_way; ++i)
     {
         set_value_in_uint16(first_index, run_sum, i);
         run_sum += get_value_in_uint16(total, i);

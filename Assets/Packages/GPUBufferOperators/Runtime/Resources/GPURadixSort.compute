@@ -2,6 +2,7 @@
 #pragma kernel RadixSortLocal
 #pragma kernel GlobalShuffle
 
+#pragma use_dxc
 #pragma multi_compile _ USE_INDIRECT_DISPATCH
 
 #define DATA_TYPE uint2  // input data struct
